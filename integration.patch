@@ -1,0 +1,420 @@
+diff --git a/include/ghostty.h b/include/ghostty.h
+index 9a12b9c..0777d18 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -1188,6 +1188,26 @@ GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
+ GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
++
++typedef struct ghostty_cursor_trail* ghostty_cursor_trail_t;
++typedef struct {
++  float x, y, width, height, cell_width, cell_height, fast_decay, slow_decay;
++  uint32_t hold_ms, threshold_x, threshold_y;
++  uint8_t red, green, blue, alpha;
++  bool cursor_visible, display_p3;
++} ghostty_cursor_trail_sample_s;
++typedef struct {
++  float x0, y0, x1, y1, x2, y2, x3, y3, opacity;
++  bool active, pending;
++} ghostty_cursor_trail_output_s;
++typedef void (*ghostty_cursor_trail_callback_t)(void*, const ghostty_cursor_trail_sample_s*);
++GHOSTTY_API void ghostty_surface_set_cursor_trail_callback(ghostty_surface_t, ghostty_cursor_trail_callback_t);
++GHOSTTY_API ghostty_cursor_trail_t ghostty_cursor_trail_new(void);
++GHOSTTY_API void ghostty_cursor_trail_free(ghostty_cursor_trail_t);
++GHOSTTY_API void ghostty_cursor_trail_reset(ghostty_cursor_trail_t);
++GHOSTTY_API void ghostty_cursor_trail_observe(ghostty_cursor_trail_t, uint64_t, float, float, float, float);
++GHOSTTY_API void ghostty_cursor_trail_step(ghostty_cursor_trail_t, const ghostty_cursor_trail_sample_s*, float, float, ghostty_cursor_trail_output_s*);
++
+ GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+ GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
+ GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+diff --git a/macos/Sources/Features/Terminal/BaseTerminalController.swift b/macos/Sources/Features/Terminal/BaseTerminalController.swift
+index 79ca5b6..82d6b0e 100644
+--- a/macos/Sources/Features/Terminal/BaseTerminalController.swift
++++ b/macos/Sources/Features/Terminal/BaseTerminalController.swift
+@@ -1273,6 +1273,7 @@ class BaseTerminalController: NSWindowController,
+     }
+ 
+     func windowDidResignKey(_ notification: Notification) {
++        terminalViewContainer?.resetCursorTrail()
+         // Becoming/losing key means we have to notify our surface(s) that we have focus
+         // so things like cursors blink, pty events are sent, etc.
+         self.syncFocusToSurfaceTree()
+diff --git a/macos/Sources/Features/Terminal/TerminalViewContainer.swift b/macos/Sources/Features/Terminal/TerminalViewContainer.swift
+index 14e47b7..784811a 100644
+--- a/macos/Sources/Features/Terminal/TerminalViewContainer.swift
++++ b/macos/Sources/Features/Terminal/TerminalViewContainer.swift
+@@ -1,10 +1,31 @@
+ import AppKit
+ import SwiftUI
++import GhosttyKit
+ 
+ /// Use this container to achieve a glass effect at the window level.
+ /// Modifying `NSThemeFrame` can sometimes be unpredictable.
+ class TerminalViewContainer: NSView {
+     private let terminalView: NSView
++    private var cursorTrailView: CursorTrailView?
++
++    func resetCursorTrail() { cursorTrailView?.reset() }
++
++    func showCursorTrail(_ sample: ghostty_cursor_trail_sample_s, from surface: Ghostty.SurfaceView) {
++        guard surface.focused, window?.isKeyWindow == true else { return }
++        if sample.hold_ms == 0 {
++            cursorTrailView?.removeFromSuperview()
++            cursorTrailView = nil
++            return
++        }
++
++        let overlay = cursorTrailView ?? CursorTrailView(frame: bounds)
++        if cursorTrailView == nil {
++            addSubview(overlay, positioned: .above, relativeTo: terminalView)
++            overlay.autoresizingMask = [.width, .height]
++            cursorTrailView = overlay
++        }
++        overlay.update(sample, from: surface)
++    }
+ 
+     /// Background color applied with glass effect
+     private(set) var glassEffectView: NSView?
+diff --git a/macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift b/macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift
+index cbec307..05022e2 100644
+--- a/macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift	
++++ b/macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift	
+@@ -393,6 +393,14 @@ extension Ghostty {
+                 return
+             }
+             self.surfaceModel = Ghostty.Surface(cSurface: surface)
++            ghostty_surface_set_cursor_trail_callback(surface) { userdata, sample in
++                guard let userdata, let sample else { return }
++                let view = Unmanaged<Ghostty.SurfaceView>.fromOpaque(userdata).takeUnretainedValue()
++                let value = sample.pointee
++                MainActor.assumeIsolated {
++                    (view.window?.contentView as? TerminalViewContainer)?.showCursorTrail(value, from: view)
++                }
++            }
+ 
+             // Setup our tracking area so we get mouse moved events
+             updateTrackingAreas()
+diff --git a/src/Surface.zig b/src/Surface.zig
+index 369bb23..1278761 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -1155,6 +1155,10 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
+ 
+         .renderer_health => |health| self.updateRendererHealth(health),
+ 
++        .cursor_trail => |sample| if (@hasDecl(apprt.runtime.Surface, "cursorTrail")) {
++            self.rt_surface.cursorTrail(&sample);
++        },
++
+         .scrollbar => |scrollbar| self.updateScrollbar(scrollbar),
+ 
+         .present_surface => try self.presentSurface(),
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index 697f0a7..fbd1564 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -19,6 +19,7 @@ const terminal = @import("../terminal/main.zig");
+ const CoreApp = @import("../App.zig");
+ const CoreInspector = @import("../inspector/main.zig").Inspector;
+ const CoreSurface = @import("../Surface.zig");
++const CursorTrail = @import("../renderer/CursorTrail.zig");
+ const configpkg = @import("../config.zig");
+ const Config = configpkg.Config;
+ const String = @import("../main_c.zig").String;
+@@ -449,6 +450,7 @@ pub const Surface = struct {
+     platform: Platform,
+     userdata: ?*anyopaque = null,
+     core_surface: CoreSurface,
++    cursor_trail_callback: ?*const fn (?*anyopaque, *const CursorTrail.Sample) callconv(.c) void = null,
+     content_scale: apprt.ContentScale,
+     size: apprt.SurfaceSize,
+     cursor_pos: apprt.CursorPos,
+@@ -1167,6 +1169,10 @@ pub const Surface = struct {
+         }, state);
+     }
+ 
++    pub fn cursorTrail(self: *Surface, sample: *const CursorTrail.Sample) void {
++        if (self.cursor_trail_callback) |callback| callback(self.userdata, sample);
++    }
++
+     pub fn focusCallback(self: *Surface, focused: bool) void {
+         self.core_surface.focusCallback(focused) catch |err| {
+             log.err("error in focus callback err={}", .{err});
+@@ -2038,6 +2044,70 @@ pub const CAPI = struct {
+         surface.updateContentScale(x, y);
+     }
+ 
++    export fn ghostty_surface_set_cursor_trail_callback(
++        surface: *Surface,
++        callback: @FieldType(Surface, "cursor_trail_callback"),
++    ) void {
++        surface.cursor_trail_callback = callback;
++    }
++
++    export fn ghostty_cursor_trail_new() ?*CursorTrail {
++        const trail = global.alloc().create(CursorTrail) catch return null;
++        trail.* = .{};
++        return trail;
++    }
++
++    export fn ghostty_cursor_trail_free(trail: *CursorTrail) void {
++        global.alloc().destroy(trail);
++    }
++
++    export fn ghostty_cursor_trail_reset(trail: *CursorTrail) void {
++        trail.* = .{};
++    }
++
++    export fn ghostty_cursor_trail_observe(
++        trail: *CursorTrail,
++        surface_id: u64,
++        x: f32,
++        y: f32,
++        width: f32,
++        height: f32,
++    ) void {
++        if (width <= 0 or height <= 0) return;
++        trail.observeSurface(surface_id, .{ .min = .{ x, y }, .max = .{ x + width, y + height } }, .now(global.io(), .awake));
++    }
++
++    export fn ghostty_cursor_trail_step(
++        trail: *CursorTrail,
++        sample: *const CursorTrail.Sample,
++        width: f32,
++        height: f32,
++        output: *CursorTrail.Output,
++    ) void {
++        trail.advance(
++            .now(global.io(), .awake),
++            sample.cursor_visible,
++            sample.hold_ms,
++            .{ sample.threshold_x, sample.threshold_y },
++            .{ sample.fast_decay, sample.slow_decay },
++            .{ sample.cell_width, sample.cell_height },
++            .{ width, height },
++        );
++        output.* = .{
++            .x0 = trail.corners[0][0],
++            .y0 = trail.corners[0][1],
++            .x1 = trail.corners[1][0],
++            .y1 = trail.corners[1][1],
++            .x2 = trail.corners[2][0],
++            .y2 = trail.corners[2][1],
++            .x3 = trail.corners[3][0],
++            .y3 = trail.corners[3][1],
++            .opacity = trail.opacity,
++            .active = trail.active,
++            .pending = trail.dirty,
++        };
++    }
++
+     /// Update the focused state of a surface.
+     export fn ghostty_surface_set_focus(surface: *Surface, focused: bool) void {
+         surface.focusCallback(focused);
+diff --git a/src/apprt/surface.zig b/src/apprt/surface.zig
+index 3b1a04d..b1e90a3 100644
+--- a/src/apprt/surface.zig
++++ b/src/apprt/surface.zig
+@@ -112,6 +112,9 @@ pub const Message = union(enum) {
+     /// Health status change for the renderer.
+     renderer_health: renderer.Health,
+ 
++    /// Changed native cursor geometry or trail settings.
++    cursor_trail: @import("../renderer/CursorTrail.zig").Sample,
++
+     /// Tell the surface to present itself to the user. This may require raising
+     /// a window and switching tabs.
+     present_surface: void,
+diff --git a/src/config/Config.zig b/src/config/Config.zig
+index 19667ab..caa1fb6 100644
+--- a/src/config/Config.zig
++++ b/src/config/Config.zig
+@@ -865,6 +865,20 @@ palette: Palette = .{},
+ /// make it difficult to find the cursor.
+ @"cursor-opacity": f64 = 1.0,
+ 
++/// Minimum cursor dwell time in milliseconds before the native cursor trail on macOS
++/// follows a cursor move. A value of zero disables the trail.
++cursor_trail: u32 = 0,
++
++/// The fast and slow corner decay times in seconds, separated by spaces.
++cursor_trail_decay: @import("CursorTrail.zig").Decay = .{},
++
++/// Suppress new trails when both movement components are within these
++/// thresholds, in cells. Specify one value or an X and Y value.
++cursor_trail_start_threshold: @import("CursorTrail.zig").Threshold = .{},
++
++/// Color of the native cursor trail, or "none" to follow the cursor color.
++cursor_trail_color: @import("CursorTrail.zig").Color = .{},
++
+ /// The style of the cursor. This sets the default style. A running program can
+ /// still request an explicit cursor style using escape sequences (such as `CSI
+ /// q`). Shell configurations will often request specific cursor styles.
+diff --git a/src/renderer/generic.zig b/src/renderer/generic.zig
+index df70aa3..a0310ee 100644
+--- a/src/renderer/generic.zig
++++ b/src/renderer/generic.zig
+@@ -19,6 +19,7 @@ const constraintWidth = cellpkg.constraintWidth;
+ const isCovering = cellpkg.isCovering;
+ const rowNeverExtendBg = @import("row.zig").neverExtendBg;
+ const Overlay = @import("Overlay.zig");
++const CursorTrail = @import("CursorTrail.zig");
+ const imagepkg = @import("image.zig");
+ const ImageState = imagepkg.State;
+ const shadertoy = @import("shadertoy.zig");
+@@ -108,6 +109,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+         const shaderpkg = GraphicsAPI.shaders;
+         const Shaders = shaderpkg.Shaders;
+ 
++        // The app owns the trail per tab. Keep only the last published sample
++        // in the renderer so repeated draws do not wake the app thread.
++        trail_published: ?CursorTrail.Sample = null,
++        trail_sample: CursorTrail.Sample = .{},
++
+         /// Allocator that can be used
+         alloc: std.mem.Allocator,
+ 
+@@ -595,6 +601,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             font_shaping_break: configpkg.FontShapingBreak,
+             cursor_color: ?configpkg.Config.TerminalColor,
+             cursor_opacity: f64,
++            cursor_trail_hold: u32,
++            cursor_trail_decay: [2]f32,
++            cursor_trail_threshold: [2]u32,
++            cursor_trail_color: ?terminal.color.RGB,
+             cursor_text: ?configpkg.Config.TerminalColor,
+             background: terminal.color.RGB,
+             background_opacity: f64,
+@@ -669,6 +679,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                     .cursor_color = config.@"cursor-color",
+                     .cursor_text = config.@"cursor-text",
+                     .cursor_opacity = @max(0, @min(1, config.@"cursor-opacity")),
++                    .cursor_trail_hold = config.cursor_trail,
++                    .cursor_trail_decay = config.cursor_trail_decay.values,
++                    .cursor_trail_threshold = config.cursor_trail_start_threshold.values,
++                    .cursor_trail_color = if (config.cursor_trail_color.value) |color| color.toTerminalRGB() else null,
+ 
+                     .background = config.background.toTerminalRGB(),
+                     .foreground = config.foreground.toTerminalRGB(),
+@@ -1196,6 +1210,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             assert(self.focused != focus);
+ 
+             self.focused = focus;
++            if (!focus) self.trail_published = null;
+ 
+             // Flag that we need to update our custom shaders
+             self.custom_shader_focused_changed = true;
+@@ -1672,6 +1687,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                     self.scrollbar_dirty = true;
+                 }
+ 
++                if (comptime builtin.target.os.tag == .macos) self.publishCursorTrail();
++
+                 // Update our background color
+                 self.uniforms.bg_color = .{
+                     self.terminal_state.colors.background.r,
+@@ -2757,6 +2774,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                 };
+             }
+ 
++            if (comptime builtin.target.os.tag == .macos) self.trail_sample = .{
++                .hold_ms = self.config.cursor_trail_hold,
++                .cursor_visible = state.cursor.visible and state.cursor.viewport != null and
++                    !state.cursor.password_input and preedit == null,
++            };
++
+             // Setup our cursor rendering information.
+             cursor: {
+                 // Clear our cursor by default.
+@@ -2784,7 +2807,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+ 
+                 // If there isn't a cursor visual style requested then
+                 // we don't render a cursor.
+-                const style = cursor_style_ orelse break :cursor;
++                const style = cursor_style_ orelse style: {
++                    if (comptime builtin.target.os.tag != .macos) break :cursor;
++                    if (self.config.cursor_trail_hold == 0 or !self.focused or !self.trail_sample.cursor_visible)
++                        break :cursor;
++                    break :style renderer.CursorStyle.fromTerminal(state.cursor.visual_style);
++                };
+ 
+                 // Determine the cursor color.
+                 const cursor_color = cursor_color: {
+@@ -2829,8 +2857,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                     &state.cursor,
+                     style,
+                     cursor_color,
++                    cursor_style_ != null,
+                 );
+ 
++                if (cursor_style_ == null) break :cursor;
++
+                 // If the cursor is visible then we set our uniforms.
+                 if (style == .block) {
+                     const wide = state.cursor.cell.wide;
+@@ -3541,6 +3572,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             cursor_state: *const terminal.RenderState.Cursor,
+             cursor_style: renderer.CursorStyle,
+             cursor_color: terminal.color.RGB,
++            draw_cursor: bool,
+         ) void {
+             const cursor_vp = cursor_state.viewport orelse return;
+ 
+@@ -3611,6 +3643,38 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+                 },
+             };
+ 
++            if (comptime builtin.target.os.tag == .macos) {
++                if (self.focused and self.trail_sample.cursor_visible and self.trail_sample.hold_ms != 0) {
++                    const color = self.config.cursor_trail_color orelse cursor_color;
++                    const x_cell = @as(f32, @floatFromInt(x));
++                    const y_cell = @as(f32, @floatFromInt(cursor_vp.y));
++                    self.trail_sample = .{
++                        .x = x_cell * self.uniforms.cell_size[0] +
++                            @as(f32, @floatFromInt(self.size.padding.left)) +
++                            @as(f32, @floatFromInt(render.glyph.offset_x)),
++                        .y = (y_cell + 1) * self.uniforms.cell_size[1] +
++                            @as(f32, @floatFromInt(self.size.padding.top)) -
++                            @as(f32, @floatFromInt(render.glyph.offset_y)),
++                        .width = @floatFromInt(render.glyph.width),
++                        .height = @floatFromInt(render.glyph.height),
++                        .cell_width = self.uniforms.cell_size[0],
++                        .cell_height = self.uniforms.cell_size[1],
++                        .fast_decay = self.config.cursor_trail_decay[0],
++                        .slow_decay = self.config.cursor_trail_decay[1],
++                        .hold_ms = self.config.cursor_trail_hold,
++                        .threshold_x = self.config.cursor_trail_threshold[0],
++                        .threshold_y = self.config.cursor_trail_threshold[1],
++                        .red = color.r,
++                        .green = color.g,
++                        .blue = color.b,
++                        .alpha = alpha,
++                        .cursor_visible = true,
++                        .display_p3 = self.uniforms.bools.use_display_p3,
++                    };
++                }
++            }
++
++            if (!draw_cursor) return;
+             self.cells.setCursor(.{
+                 .atlas = .grayscale,
+                 .bools = .{ .is_cursor_glyph = true },
+@@ -3625,6 +3689,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
+             }, cursor_style);
+         }
+ 
++        fn publishCursorTrail(self: *Self) void {
++            if (!self.focused) return;
++            if (self.trail_published) |sent| {
++                if (std.meta.eql(sent, self.trail_sample)) return;
++            } else if (self.trail_sample.hold_ms == 0) return;
++
++            if (self.surface_mailbox.push(.{ .cursor_trail = self.trail_sample }, .instant) > 0)
++                self.trail_published = self.trail_sample;
++        }
++
+         fn addPreeditCell(
+             self: *Self,
+             cp: renderer.State.Preedit.Codepoint,
