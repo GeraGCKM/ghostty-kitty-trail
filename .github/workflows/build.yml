@@ -1,0 +1,137 @@
+name: Build Ghostty with cursor trail
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/build.yml
+      - integration.patch
+      - install-module.sh
+      - modules/**
+  schedule:
+    - cron: '23 16 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ghostty-kitty-trail
+  cancel-in-progress: false
+
+jobs:
+  upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      build: ${{ steps.tag.outputs.build }}
+    steps:
+      - name: Resolve the latest stable Ghostty tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git ls-remote --tags --refs --sort=-v:refname https://github.com/ghostty-org/ghostty.git 'refs/tags/v[0-9]*' > "$RUNNER_TEMP/tags"
+          tag="$(awk '$2 ~ /^refs\/tags\/v[0-9]+\.[0-9]+\.[0-9]+$/ && !found {sub(/^refs\/tags\//, "", $2); print $2; found=1}' "$RUNNER_TEMP/tags")"
+          test -n "$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_EVENT_NAME" == schedule ]] &&
+             gh release view "ghostty-${tag}-trail" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' > "$RUNNER_TEMP/assets" &&
+             grep -Fxq "Ghostty-${tag}-AppleSilicon.zip" "$RUNNER_TEMP/assets"; then
+            echo 'build=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'build=true' >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: upstream
+    if: needs.upstream.outputs.build == 'true'
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      GHOSTTY_TAG: ${{ needs.upstream.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the module into a fresh upstream checkout
+        id: module
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$GHOSTTY_TAG" https://github.com/ghostty-org/ghostty.git upstream
+          bash install-module.sh upstream
+          version="$(sed -nE 's/.*\.minimum_zig_version = "([^"]+)".*/\1/p' upstream/build.zig.zon)"
+          test -n "$version"
+          echo "zig=$version" >> "$GITHUB_OUTPUT"
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ steps.module.outputs.zig }}
+      - name: Prepare Xcode and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          brew install gettext
+          echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --find metal || xcodebuild -downloadComponent MetalToolchain
+      - name: Test, build and verify the app
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig test src/renderer/CursorTrail.zig
+          zig build -Doptimize=ReleaseFast -Dxcframework-target=native
+          app=zig-out/Ghostty.app
+          executable="$app/Contents/MacOS/ghostty"
+          test "$(lipo -archs "$executable")" = arm64
+          "$executable" +show-config --default --no-pager > "$RUNNER_TEMP/defaults"
+          grep -Fx 'cursor_trail = 0' "$RUNNER_TEMP/defaults"
+          grep -Fx 'cursor_trail_color = none' "$RUNNER_TEMP/defaults"
+          grep -E '^cursor_trail_decay = 0\.1[0-9]* 0\.4[0-9]*$' "$RUNNER_TEMP/defaults"
+          mkdir -p "$RUNNER_TEMP/trail-config/ghostty"
+          printf '%s\n' 'cursor_trail = 1' 'cursor_trail_decay = 0.2 0.6' 'cursor_trail_start_threshold = 3 4' 'cursor_trail_color = red' > "$RUNNER_TEMP/trail-config/ghostty/config.ghostty"
+          XDG_CONFIG_HOME="$RUNNER_TEMP/trail-config" "$executable" +show-config --no-pager --changes-only > "$RUNNER_TEMP/loaded"
+          grep -Fx 'cursor_trail = 1' "$RUNNER_TEMP/loaded"
+          grep -Fx 'cursor_trail_start_threshold = 3 4' "$RUNNER_TEMP/loaded"
+          grep -Fx 'cursor_trail_color = #ff0000' "$RUNNER_TEMP/loaded"
+          codesign --verify --deep "$app"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          ditto -c -k --keepParent "$app" "$GITHUB_WORKSPACE/dist/Ghostty-${GHOSTTY_TAG}-AppleSilicon.zip"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Ghostty-${{ env.GHOSTTY_TAG }}-AppleSilicon
+          path: dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [upstream, build]
+    if: github.ref_name == github.event.repository.default_branch && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GHOSTTY_TAG: ${{ needs.upstream.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: Ghostty-${{ env.GHOSTTY_TAG }}-AppleSilicon
+          path: dist
+      - name: Publish the Apple Silicon build
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="ghostty-${GHOSTTY_TAG}-trail"
+          asset="dist/Ghostty-${GHOSTTY_TAG}-AppleSilicon.zip"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "Ghostty $GHOSTTY_TAG · Kitty-style cursor trail" \
+              --notes "Apple Silicon build. Enable the native cursor trail in your Ghostty config with cursor_trail = 1."
+          fi
