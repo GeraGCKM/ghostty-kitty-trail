@@ -7,7 +7,7 @@ final class CursorTrailView: NSView {
     private let trail = ghostty_cursor_trail_new()
     private let shape = CAShapeLayer()
     private let cursorMask = CAShapeLayer()
-    private var timer: Timer?
+    private var stopFrameSource: (() -> Void)?
     private weak var source: Ghostty.SurfaceView?
     private var sourceID: UInt64 = 0
     private var sample = ghostty_cursor_trail_sample_s()
@@ -31,7 +31,7 @@ final class CursorTrailView: NSView {
     }
 
     deinit {
-        timer?.invalidate()
+        stopFrameSource?()
         if let trail { ghostty_cursor_trail_free(trail) }
     }
 
@@ -101,20 +101,53 @@ final class CursorTrailView: NSView {
         if frame.active {
             draw(frame)
         } else {
-            stop()
+            hideShape()
         }
-        if (frame.active || frame.pending) && timer == nil {
-            let timer = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
+
+        if frame.active || frame.pending {
+            startFrameSource()
+        } else {
+            stopFrameSource?()
+            stopFrameSource = nil
+        }
+    }
+
+    private func startFrameSource() {
+        guard stopFrameSource == nil else { return }
+        if #available(macOS 14.0, *) {
+            let target = FrameTarget(view: self)
+            let link = displayLink(target: target, selector: #selector(FrameTarget.tick(_:)))
+            link.add(to: .main, forMode: .common)
+            stopFrameSource = { link.invalidate() }
+        } else {
+            let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.advance() }
             }
             RunLoop.main.add(timer, forMode: .common)
-            self.timer = timer
+            stopFrameSource = { timer.invalidate() }
+        }
+    }
+
+    @available(macOS 14.0, *)
+    @MainActor
+    private final class FrameTarget: NSObject {
+        weak var view: CursorTrailView?
+
+        init(view: CursorTrailView) { self.view = view }
+
+        @objc func tick(_ sender: CADisplayLink) {
+            view?.advance()
         }
     }
 
     private func stop() {
-        timer?.invalidate()
-        timer = nil
+        stopFrameSource?()
+        stopFrameSource = nil
+        hideShape()
+    }
+
+    private func hideShape() {
+        guard !shape.isHidden else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         shape.isHidden = true
