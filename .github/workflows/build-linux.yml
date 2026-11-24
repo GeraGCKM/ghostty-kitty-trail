@@ -76,9 +76,22 @@ jobs:
           set -euo pipefail
           apt_options=(-o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
           sudo apt-get "${apt_options[@]}" update
-          sudo env DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" install -y blueprint-compiler gettext libadwaita-1-dev libegl-dev \
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" install -y gettext libadwaita-1-dev libegl-dev minisign \
             libgtk-4-dev libgtk4-layer-shell-dev libwayland-dev libx11-dev ncurses-bin pkg-config wayland-protocols
           pkg-config --modversion gtk4 libadwaita-1 egl gtk4-layer-shell-0
+      - name: Load the signed release's prebuilt GTK resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GHOSTTY_TAG#v}"
+          name="ghostty-$version"
+          archive="$RUNNER_TEMP/$name.tar.gz"
+          url="https://release.files.ghostty.org/$version/$name.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 --output "$archive" "$url"
+          curl --fail --silent --show-error --location --retry 3 --output "$archive.minisig" "$url.minisig"
+          minisign -Vm "$archive" -P 'RWQlAjJC23149WL2sEpT/l0QKy7hMIFhYdQOFy0Z7z7PbneUgvlsnYcV'
+          tar -xzf "$archive" -C upstream --strip-components=1 \
+            "$name/src/apprt/gtk/ghostty_resources.c" "$name/src/apprt/gtk/ghostty_resources.h"
       - name: Compile Ghostty with GTK
         working-directory: upstream
         shell: bash
