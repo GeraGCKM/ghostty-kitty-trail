@@ -6,7 +6,6 @@ on:
     paths:
       - .github/workflows/build-linux.yml
       - integration.patch
-      - install-module.sh
       - modules/**
   schedule:
     - cron: '38 16 * * *'
@@ -56,19 +55,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install the module into a fresh upstream checkout
-        id: module
-        shell: bash
-        run: |
-          set -euo pipefail
-          git clone --depth 1 --branch "$GHOSTTY_TAG" https://github.com/ghostty-org/ghostty.git upstream
-          bash install-module.sh upstream
-          version="$(sed -nE 's/.*\.minimum_zig_version = "([^"]+)".*/\1/p' upstream/build.zig.zon)"
-          test -n "$version"
-          echo "zig=$version" >> "$GITHUB_OUTPUT"
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: ${{ steps.module.outputs.zig }}
       - name: Install GTK build dependencies
         timeout-minutes: 6
         shell: bash
@@ -79,7 +65,8 @@ jobs:
           sudo env DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" install -y gettext libadwaita-1-dev libegl-dev minisign \
             libgtk-4-dev libgtk4-layer-shell-dev libwayland-dev libx11-dev ncurses-bin pkg-config wayland-protocols
           pkg-config --modversion gtk4 libadwaita-1 egl gtk4-layer-shell-0
-      - name: Load the signed release's prebuilt GTK resources
+      - name: Prepare the signed Ghostty release source
+        id: source
         shell: bash
         run: |
           set -euo pipefail
@@ -90,10 +77,24 @@ jobs:
           curl --fail --silent --show-error --location --retry 3 --output "$archive" "$url"
           curl --fail --silent --show-error --location --retry 3 --output "$archive.minisig" "$url.minisig"
           minisign -Vm "$archive" -P 'RWQlAjJC23149WL2sEpT/l0QKy7hMIFhYdQOFy0Z7z7PbneUgvlsnYcV'
-          tar -xzf "$archive" -C upstream --strip-components=1 \
-            "$name/src/apprt/gtk/ghostty_resources.c" "$name/src/apprt/gtk/ghostty_resources.h"
+          src="$RUNNER_TEMP/ghostty-source"
+          mkdir -p "$src"
+          tar -xzf "$archive" -C "$src" --strip-components=1
+          test "$(cat "$src/VERSION")" = "$version"
+          git -C "$src" apply --check "$GITHUB_WORKSPACE/integration.patch"
+          git -C "$src" apply "$GITHUB_WORKSPACE/integration.patch"
+          install -m 0644 modules/animation.zig "$src/src/renderer/CursorTrail.zig"
+          install -m 0644 modules/config.zig "$src/src/config/CursorTrail.zig"
+          install -m 0644 modules/CursorTrailView.swift "$src/macos/Sources/Features/Terminal/CursorTrailView.swift"
+          zig_version="$(sed -nE 's/.*\.minimum_zig_version = "([^"]+)".*/\1/p' "$src/build.zig.zon")"
+          test -n "$zig_version"
+          echo "zig=$zig_version" >> "$GITHUB_OUTPUT"
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ steps.source.outputs.zig }}
+          cache-local: false
       - name: Compile Ghostty with GTK
-        working-directory: upstream
+        working-directory: ${{ runner.temp }}/ghostty-source
         shell: bash
         run: |
           set -euo pipefail
