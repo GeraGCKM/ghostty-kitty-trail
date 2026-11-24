@@ -17,7 +17,7 @@ permissions:
 
 concurrency:
   group: ghostty-linux-x86_64
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   upstream:
@@ -83,7 +83,7 @@ jobs:
         run: |
           set -euo pipefail
           zig test src/renderer/CursorTrail.zig
-          zig build -Dapp-runtime=gtk -Doptimize=ReleaseFast -Demit-docs=false -fsys=gtk4-layer-shell \
+          zig build -Dapp-runtime=gtk -Dcpu=baseline -Doptimize=ReleaseFast -Demit-docs=false -fsys=gtk4-layer-shell \
             --prefix "$RUNNER_TEMP/ghostty-linux"
       - name: Verify and package the Linux build
         shell: bash
